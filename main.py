@@ -347,7 +347,7 @@ def change_password(req: ChangePasswordRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.now(timezone.utc).isozone()}
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/")
 def root():

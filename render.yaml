@@ -1,0 +1,17 @@
+name: dentamap
+runtime: python
+release: "1.0.0"
+
+# Environment variables
+envVars:
+  - key: KOIS_SECRET
+    value: Radiant2026!
+  - key: PYTHON_VERSION
+    value: "3.11.0"
+
+# Build & run
+buildCommand: pip install -r requirements.txt
+startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+# Health check
+healthCheckPath: /health
