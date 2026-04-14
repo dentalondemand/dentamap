@@ -347,4 +347,14 @@ def change_password(req: ChangePasswordRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "time": datetime.now(timezone.utc).isozone()}
+
+@app.get("/")
+def root():
+    return HTMLResponse("""
+    <html><head><title>DentaMap</title></head>
+    <body style="font-family:sans-serif;padding:40px;text-align:center">
+        <h1>DentaMap</h1>
+        <p>DentaMap API is running. <a href="/health">Health check</a></p>
+    </body></html>
+    """)
