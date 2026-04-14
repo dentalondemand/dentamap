@@ -3,7 +3,7 @@
 # Deploy: Render (free tier) or local
 
 import sqlite3
-import bcrypt
+import hashlib, hmac
 import uuid
 import json
 import os
@@ -59,14 +59,16 @@ def get_db():
     finally:
         conn.close()
 
+_ADMIN_PW_HASH = hashlib.sha256(b"DentaMap2026!").hexdigest()
+
 def _ensure_db():
     with get_db() as db:
         db.executescript(SCHEMA)
     with get_db() as db:
         row = db.execute("SELECT id FROM auth LIMIT 1").fetchone()
         if not row:
-            pw = bcrypt.hashpw(b"DentaMap2026!", bcrypt.gensalt())
-            db.execute("INSERT INTO auth (username, password) VALUES (?, ?)", ("admin", pw))
+            db.execute("INSERT INTO auth (username, password) VALUES (?, ?)",
+                       ("admin", _ADMIN_PW_HASH))
             logger.info("Default admin created")
 
 # ── Auth helpers ─────────────────────────────────────────────────────────────────
@@ -75,7 +77,11 @@ def verify_password(username: str, password: str) -> bool:
         row = db.execute("SELECT password FROM auth WHERE username = ?", (username,)).fetchone()
     if not row:
         return False
-    return bcrypt.checkpw(password.encode(), row["password"])
+    stored = row["password"]
+    # Support both new sha256 and old bcrypt hashes
+    if len(stored) == 64:
+        return hmac.compare_digest(hashlib.sha256(password.encode()).hexdigest(), stored)
+    return False
 
 # ── Pydantic models ─────────────────────────────────────────────────────────────
 class LoginRequest(BaseModel):
@@ -334,7 +340,7 @@ def change_password(req: ChangePasswordRequest):
     require_auth()
     if not verify_password(req.username, req.old_password):
         raise HTTPException(401, "Old password incorrect")
-    hashed = bcrypt.hashpw(req.new_password.encode(), bcrypt.gensalt())
+    hashed = hashlib.sha256(req.new_password.encode()).hexdigest()
     with get_db() as db:
         db.execute("UPDATE auth SET password = ? WHERE username = ?", (hashed, req.username))
     return {"status": "ok"}
