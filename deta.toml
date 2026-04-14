@@ -1,0 +1,14 @@
+name: dentamap
+runtime: python311
+release: "1.0.0"
+
+# Environment variables (set via: deta env set KOIS_SECRET=value --project <name>)
+# KOIS_SECRET — bearer token for API access
+
+endpoint: /
+cron: "*/25 * * * *"
+
+requirements: ./requirements.txt
+
+build: pip install -r requirements.txt
+run: uvicorn main:app --host 0.0.0.0 --port $PORT
