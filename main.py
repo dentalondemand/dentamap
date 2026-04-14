@@ -1,9 +1,29 @@
 # DentaMap — Diagnostic Tool Cloud
 # Radiant Dental Care | Dr. Jay Siddiqui
-# Deploy: Render (PostgreSQL) or local (SQLite)
-import psycopg2
-import psycopg2.extras
-SCHEMA_SQL = """
+# Deploy: Render (free tier) or local
+
+import sqlite3
+import bcrypt
+import uuid
+import json
+import os
+import logging
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Optional, Dict
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── Database (SQLite — file persists on Render's /tmp) ─────────────────────────
+DB = "/tmp/dentamap.db"
+
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS exams (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     exam_id          TEXT    UNIQUE NOT NULL,
@@ -18,38 +38,18 @@ CREATE TABLE IF NOT EXISTS exams (
     dentist_notes   TEXT,
     created_at      TEXT    NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS auth (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL   -- bcrypt hash
+    password TEXT NOT NULL
 );
 """
 
-_auth_checked = False
-
-def q(sql_s, pg_s):
-    """Return SQLite or PostgreSQL query based on DB in use."""
-    return pg_s if _use_pg else sql_s
-
-def _ensure_db():
-    with get_db() as db:
-        if _use_pg:
-            db.execute(SCHEMA_SQL)
-        else:
-            db.executescript(SCHEMA_SQL)
-    _init_default_auth()
-
 @contextmanager
 def get_db():
-    if _use_pg:
-        conn = psycopg2.connect(os.environ["DATABASE_URL"], sslmode="require",
-                               cursor_factory=psycopg2.extras.RealDictCursor)
-        conn.autocommit = False
-    else:
-        conn = sqlite3.connect(DATABASE, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
+    conn = sqlite3.connect(DB, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
     try:
         yield conn
         conn.commit()
@@ -59,38 +59,23 @@ def get_db():
     finally:
         conn.close()
 
-def _init_default_auth():
-    """Create default admin user if no users exist."""
-def _init_default_auth():
-    import bcrypt
+def _ensure_db():
     with get_db() as db:
-        cur = db.execute("SELECT id FROM auth LIMIT 1")
-        row = cur.fetchone()
+        db.executescript(SCHEMA)
+    with get_db() as db:
+        row = db.execute("SELECT id FROM auth LIMIT 1").fetchone()
         if not row:
-            pw_hash = bcrypt.hashpw(b"RDC-KOIS-2026!", bcrypt.gensalt())
-            if _use_pg:
-                db.execute("INSERT INTO auth (username, password) VALUES (%s, %s)", ("admin", pw_hash))
-            else:
-                db.execute("INSERT INTO auth (username, password) VALUES (?, ?)", ("admin", pw_hash))
-            logger.info("Default admin user created")
+            pw = bcrypt.hashpw(b"DentaMap2026!", bcrypt.gensalt())
+            db.execute("INSERT INTO auth (username, password) VALUES (?, ?)", ("admin", pw))
+            logger.info("Default admin created")
 
-# ── Auth helpers ────────────────────────────────────────────────────────────────
+# ── Auth helpers ─────────────────────────────────────────────────────────────────
 def verify_password(username: str, password: str) -> bool:
-    import bcrypt
     with get_db() as db:
-        if _use_pg:
-            cur = db.execute("SELECT password FROM auth WHERE username = %s", (username,))
-        else:
-            cur = db.execute("SELECT password FROM auth WHERE username = ?", (username,))
-        row = cur.fetchone()
+        row = db.execute("SELECT password FROM auth WHERE username = ?", (username,)).fetchone()
     if not row:
         return False
-    pwd_stored = bytes(row[0]) if _use_pg else bytes(row["password"])
-    return bcrypt.checkpw(password.encode(), pwd_stored)
-
-def hash_password(password: str) -> str:
-    import bcrypt
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    return bcrypt.checkpw(password.encode(), row["password"])
 
 # ── Pydantic models ─────────────────────────────────────────────────────────────
 class LoginRequest(BaseModel):
@@ -110,10 +95,8 @@ class ChangePasswordRequest(BaseModel):
     old_password: str
     new_password: str
 
-# ── KOIS scoring logic (mirrors kois_diagnostic_wizard_v3.py) ──────────────────
-KOIS_CATEGORIES = [
-    "biomechanical", "functional", "periodontal", "dentofacial"
-]
+# ── KOIS scoring ────────────────────────────────────────────────────────────────
+CAT_ORDER = ["biomechanical", "functional", "periodontal", "dentofacial"]
 
 QUESTION_MAP = {
     "biomechanical": [
@@ -150,65 +133,55 @@ QUESTION_MAP = {
     ],
 }
 
-IMPLANT_QUESTIONS = {
-    "impl_bone_volume":   "Bone volume — sufficient for implant placement without augmentation?",
+IMPLANT_Q = {
+    "impl_bone_volume":    "Bone volume — sufficient for implant placement without augmentation?",
     "impl_bone_density":  "Bone density — Misch D1-D4 classification",
-    "impl_systemic_health":"Systemic health — includes smoking, diabetes, radiation, bisphosphonates",
+    "impl_systemic_health": "Systemic health — includes smoking, diabetes, radiation, bisphosphonates",
     "impl_bruxism":       "Bruxism/clenching habits — implant fatigue risk",
     "impl_healing":       "Healing capacity — age, medications, previous implant experience",
 }
 
-INTERPRETATIONS = {
-    (4.5, 5.0):  "Optimal — No treatment needed",
-    (3.5, 4.49): "Good — Monitor/maintain, minor improvements possible",
-    (2.5, 3.49): "Fair — Treatment consideration recommended",
-    (1.5, 2.49): "Poor — Treatment recommended",
-    (0.0, 1.49): "Critical — Immediate treatment necessary",
-}
+def _interpret(score: float) -> str:
+    if score >= 4.5: return "Optimal — No treatment needed"
+    if score >= 3.5: return "Good — Monitor/maintain, minor improvements possible"
+    if score >= 2.5: return "Fair — Treatment consideration recommended"
+    if score >= 1.5: return "Poor — Treatment recommended"
+    return "Critical — Immediate treatment necessary"
 
-def interpret(score: float) -> str:
-    for (lo, hi), text in INTERPRETATIONS.items():
-        if lo <= score <= hi:
-            return text
-    return "Unknown"
-
-def score_category(cat: str, responses: Dict[str, int]) -> dict:
+def score_cat(cat: str, resp: Dict[str, int]) -> dict:
     qs = QUESTION_MAP[cat]
     vals = []
     for q in qs:
-        v = responses.get(q["id"])
+        v = resp.get(q["id"])
         if v is None:
-            raise HTTPException(400, f"Missing answer for: {q['text']}")
+            raise HTTPException(400, f"Missing: {q['text']}")
         if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 5):
             raise HTTPException(400, f"Invalid score {v} for {q['text']} (must be 1-5)")
         vals.append(v)
-    avg = round(sum(vals) / len(vals) * 2) / 2
-    avg = max(1.0, min(5.0, avg))
-    return {"score": avg, "interpretation": interpret(avg), "questions_answered": len(vals)}
+    avg = max(1.0, min(5.0, round(sum(vals) / len(vals) * 2) / 2))
+    return {"score": avg, "interpretation": _interpret(avg), "questions_answered": len(vals)}
 
-def assess_implant(responses: Dict[str, int]) -> dict:
-    required = ["impl_bone_volume","impl_bone_density","impl_systemic_health","impl_bruxism","impl_healing"]
+def score_implant(resp: Dict[str, int]) -> dict:
+    keys = list(IMPLANT_Q.keys())
     vals = {}
-    for k in required:
-        v = responses.get(k)
+    for k in keys:
+        v = resp.get(k)
         if v is None:
             raise HTTPException(400, f"Missing: {k}")
         if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 5):
             raise HTTPException(400, f"Invalid implant score {v}")
         vals[k] = v
-
-    overall = round(sum(vals.values()) / 5 * 2) / 2
+    avg = round(sum(vals.values()) / 5 * 2) / 2
     if vals["impl_systemic_health"] <= 2:
         rating = "POOR"
-    elif overall >= 4.5:
+    elif avg >= 4.5:
         rating = "EXCELLENT"
-    elif overall >= 3.5:
+    elif avg >= 3.5:
         rating = "GOOD"
-    elif overall >= 2.5:
+    elif avg >= 2.5:
         rating = "FAIR"
     else:
         rating = "POOR"
-
     recs = []
     if vals["impl_bone_volume"] <= 2:
         recs.append("Augmentation likely needed before implant placement")
@@ -220,10 +193,8 @@ def assess_implant(responses: Dict[str, int]) -> dict:
         recs.append("Occlusal guard recommended post-implant")
     if vals["impl_healing"] <= 2:
         recs.append("Extended healing protocol and close monitoring")
-
     return {
-        "overall_rating": rating,
-        "overall_score": overall,
+        "overall_rating": rating, "overall_score": avg,
         "bone_volume": vals["impl_bone_volume"],
         "bone_density": vals["impl_bone_density"],
         "systemic_health": vals["impl_systemic_health"],
@@ -232,7 +203,7 @@ def assess_implant(responses: Dict[str, int]) -> dict:
         "recommendations": recs,
     }
 
-def overall_interpretation(score: float) -> str:
+def overall_txt(score: float) -> str:
     if score >= 4.5: return "Excellent risk profile — focus on maintenance and optimization"
     if score >= 3.5: return "Good overall health — targeted improvements recommended"
     if score >= 2.5: return "Fair condition — treatment planning needed across multiple areas"
@@ -245,13 +216,12 @@ app = FastAPI(title="DentaMap API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # Lock down to your domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Simple bearer-token auth (set via DETA_SECRET env var — see main.py)
 AUTHORIZED_TOKEN = os.environ.get("KOIS_SECRET", "")
 
 def require_auth(Authorization: str = ""):
@@ -266,11 +236,10 @@ def get_questions():
     return {
         "categories": [
             {"key": k, "label": k.title(), "questions": QUESTION_MAP[k]}
-            for k in KOIS_CATEGORIES
+            for k in CAT_ORDER
         ],
         "implant_questions": [
-            {"id": kid, "text": txt}
-            for kid, txt in IMPLANT_QUESTIONS.items()
+            {"id": kid, "text": txt} for kid, txt in IMPLANT_Q.items()
         ],
     }
 
@@ -280,59 +249,44 @@ def submit_exam(sub: ExamSubmission):
     if not sub.patient_name.strip():
         raise HTTPException(400, "Patient name required")
 
-    # Score each category
     cat_scores = {}
     cat_vals = []
-    for cat in KOIS_CATEGORIES:
-        cs = score_category(cat, sub.responses)
+    for cat in CAT_ORDER:
+        cs = score_cat(cat, sub.responses)
         cat_scores[cat] = cs
         cat_vals.append(cs["score"])
 
-    overall = round(sum(cat_vals) / len(cat_vals) * 2) / 2
-    overall = max(1.0, min(5.0, overall))
-
-    # Implant risk
+    overall = max(1.0, min(5.0, round(sum(cat_vals) / len(cat_vals) * 2) / 2))
     implant_risk = None
     if sub.include_implant and sub.implant_responses:
-        implant_risk = assess_implant(sub.implant_responses)
+        implant_risk = score_implant(sub.implant_responses)
 
-    # Treatment areas (simplified)
     treatment = []
-    for cat in KOIS_CATEGORIES:
-        score = cat_scores[cat]["score"]
-        if score < 4.5:
-            treatment.append(f"**{cat.title()}:** {interpret(score)}")
+    for cat in CAT_ORDER:
+        if cat_scores[cat]["score"] < 4.5:
+            treatment.append(f"**{cat.title()}:** {_interpret(cat_scores[cat]['score'])}")
 
     exam_id = f"EXAM-{uuid.uuid4().hex[:8].upper()}"
-    created_at = datetime.now(timezone.utc).isoformat()
+    created = datetime.now(timezone.utc).isoformat()
 
     with get_db() as db:
         db.execute("""
-            INSERT INTO exams
-              (exam_id, patient_id, patient_name, responses_json,
-               overall_score, overall_assessment, category_scores_json,
-               treatment_areas_json, implant_risk_json, dentist_notes, created_at)
+            INSERT INTO exams (exam_id, patient_id, patient_name, responses_json,
+                overall_score, overall_assessment, category_scores_json,
+                treatment_areas_json, implant_risk_json, dentist_notes, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            exam_id,
-            sub.patient_id or "WALK-IN",
-            sub.patient_name,
-            json.dumps(sub.responses),
-            overall,
-            overall_interpretation(overall),
-            json.dumps(cat_scores),
-            json.dumps(treatment),
+            exam_id, sub.patient_id or "WALK-IN", sub.patient_name,
+            json.dumps(sub.responses), overall, overall_txt(overall),
+            json.dumps(cat_scores), json.dumps(treatment),
             json.dumps(implant_risk) if implant_risk else None,
-            sub.dentist_notes or None,
-            created_at,
+            sub.dentist_notes or None, created,
         ))
 
     return {
-        "exam_id": exam_id,
-        "patient_name": sub.patient_name,
-        "created_at": created_at,
-        "overall_score": overall,
-        "overall_assessment": overall_interpretation(overall),
+        "exam_id": exam_id, "patient_name": sub.patient_name,
+        "created_at": created, "overall_score": overall,
+        "overall_assessment": overall_txt(overall),
         "category_scores": cat_scores,
         "treatment_areas": treatment,
         "implant_risk": implant_risk,
@@ -342,34 +296,20 @@ def submit_exam(sub: ExamSubmission):
 def list_exams(limit: int = 30):
     require_auth()
     with get_db() as db:
-        rows = db.execute(q(
-            "SELECT exam_id, patient_id, patient_name, created_at, overall_score, overall_assessment FROM exams ORDER BY id DESC LIMIT ?",
-            "SELECT exam_id, patient_id, patient_name, created_at, overall_score, overall_assessment FROM exams ORDER BY id DESC LIMIT %s"
-        ), (limit,)).fetchall()
-    return {
-        "exams": [
-            {
-                "exam_id": r["exam_id"],
-                "patient_id": r["patient_id"],
-                "patient_name": r["patient_name"],
-                "created_at": r["created_at"],
-                "overall_score": r["overall_score"],
-                "overall_assessment": r["overall_assessment"],
-            }
-            for r in rows
-        ]
-    }
+        rows = db.execute(
+            "SELECT exam_id, patient_id, patient_name, created_at, overall_score, overall_assessment "
+            "FROM exams ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return {"exams": [dict(r) for r in rows]}
 
 @app.get("/api/exam/{exam_id}")
 def get_exam(exam_id: str):
     require_auth()
     with get_db() as db:
-        row = db.execute(q(
-            "SELECT * FROM exams WHERE exam_id = ?",
-            "SELECT * FROM exams WHERE exam_id = %s"
-        ), (exam_id,)).fetchone()
+        row = db.execute("SELECT * FROM exams WHERE exam_id = ?", (exam_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Exam not found")
+    row = dict(row)
     return {
         "exam_id": row["exam_id"],
         "patient_id": row["patient_id"],
@@ -385,29 +325,20 @@ def get_exam(exam_id: str):
 
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
-    ok = verify_password(req.username, req.password)
-    if not ok:
+    if not verify_password(req.username, req.password):
         raise HTTPException(401, "Invalid credentials")
-    token = AUTHORIZED_TOKEN or "dev-token"
-    return {"token": token, "username": req.username}
+    return {"token": AUTHORIZED_TOKEN or "dev-token", "username": req.username}
 
 @app.post("/api/auth/change-password")
 def change_password(req: ChangePasswordRequest):
     require_auth()
     if not verify_password(req.username, req.old_password):
         raise HTTPException(401, "Old password incorrect")
-    import bcrypt
     hashed = bcrypt.hashpw(req.new_password.encode(), bcrypt.gensalt())
     with get_db() as db:
-        db.execute(q(
-            "UPDATE auth SET password = ? WHERE username = ?",
-            "UPDATE auth SET password = %s WHERE username = %s"
-        ), (hashed, req.username))
+        db.execute("UPDATE auth SET password = ? WHERE username = ?", (hashed, req.username))
     return {"status": "ok"}
 
-# ── Health ──────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
-
-# EOF
